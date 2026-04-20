@@ -1,10 +1,12 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import './index.css';
 
 const API_BASE_URL = 'http://localhost:5000/api';
+const VIDEO_FEED_URL = 'http://localhost:5000/video_feed';
 
 function App() {
+  const canvasRef = useRef(null);
   const [stateData, setStateData] = useState({
     current_state_str: 'Waiting...',
     emotion_str: '...',
@@ -20,6 +22,9 @@ function App() {
   const [analyticsData, setAnalyticsData] = useState([]);
   const [activePomodoro, setActivePomodoro] = useState(false);
   const [breakMins, setBreakMins] = useState(5);
+  const [isBreakActive, setIsBreakActive] = useState(false);
+  const [breakEndTime, setBreakEndTime] = useState(null);
+  const [breakTimeRemaining, setBreakTimeRemaining] = useState(0);
 
   const fetchAnalytics = async () => {
     try {
@@ -30,9 +35,102 @@ function App() {
     } catch (err) { }
   };
 
+  // Real-time video streaming with Canvas
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    let isRunning = true;
+    let failCount = 0;
+    let frameCount = 0;
+    let lastLogTime = Date.now();
+
+    const streamVideo = async () => {
+      while (isRunning) {
+        try {
+          const response = await fetch(`${API_BASE_URL.replace('/api', '')}/video_feed_json`);
+          if (response.ok) {
+            const data = await response.json();
+            const img = new Image();
+
+            // Create a promise that resolves when image loads OR times out
+            const loadPromise = new Promise((resolve) => {
+              let loaded = false;
+
+              img.onload = () => {
+                if (!loaded) {
+                  loaded = true;
+                  if (isRunning) {
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    frameCount++;
+
+                    // Log every 30 frames
+                    const now = Date.now();
+                    if (now - lastLogTime > 1000) {
+                      console.log(`📹 Frames rendered: ${frameCount} | Backend timestamp: ${data.timestamp?.toFixed(2)}`);
+                      lastLogTime = now;
+                    }
+                  }
+                  resolve();
+                }
+              };
+
+              img.onerror = () => {
+                if (!loaded) {
+                  loaded = true;
+                  console.error('❌ Image failed to load');
+                  resolve();
+                }
+              };
+
+              // Timeout after 1 second
+              setTimeout(() => {
+                if (!loaded) {
+                  loaded = true;
+                  console.warn('⏱ Image load timeout');
+                  resolve();
+                }
+              }, 1000);
+
+              img.src = `data:image/jpeg;base64,${data.frame}`;
+            });
+
+            await loadPromise;
+            failCount = 0;
+          } else if (response.status === 503) {
+            // Camera initializing
+            failCount++;
+            if (failCount === 1) {
+              ctx.fillStyle = '#333';
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              ctx.fillStyle = '#FFF';
+              ctx.font = '20px Arial';
+              ctx.textAlign = 'center';
+              ctx.fillText('Initializing camera...', canvas.width / 2, canvas.height / 2);
+              console.log('⏳ Camera initializing...');
+            }
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+        } catch (err) {
+          console.error('❌ Video fetch error:', err);
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        // Minimal delay - as fast as possible
+        await new Promise(resolve => setTimeout(resolve, 16)); // ~60fps
+      }
+    };
+
+    streamVideo();
+
+    return () => {
+      isRunning = false;
+    };
+  }, []);
+
   useEffect(() => {
     fetchAnalytics();
-    
+
     const fetchState = async () => {
       try {
         const res = await fetch(`${API_BASE_URL}/state`);
@@ -40,10 +138,28 @@ function App() {
         setStateData(data);
       } catch (err) { }
     };
-    
-    const interval = setInterval(fetchState, 1000);
+
+    const interval = setInterval(fetchState, 500); // Check state more frequently
     return () => clearInterval(interval);
   }, []);
+
+  // Break timer countdown
+  useEffect(() => {
+    if (!isBreakActive || !breakEndTime) return;
+
+    const timer = setInterval(() => {
+      const now = Date.now();
+      const remaining = Math.max(0, breakEndTime - now);
+      setBreakTimeRemaining(remaining);
+
+      if (remaining === 0) {
+        setIsBreakActive(false);
+        setBreakEndTime(null);
+      }
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [isBreakActive, breakEndTime]);
 
   const togglePomodoro = async () => {
     try {
@@ -71,6 +187,8 @@ function App() {
           action: stateData.suggestion
         })
       });
+      // Auto-dismiss modal after feedback
+      dismissPopup();
     } catch (err) { }
   };
 
@@ -82,12 +200,29 @@ function App() {
           setActivePomodoro(false);
           fetchAnalytics();
       }
-      
+
       await fetch(`${API_BASE_URL}/break`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ minutes: breakMins })
       });
+
+      // Set break end time
+      const endTime = Date.now() + (parseInt(breakMins) * 60 * 1000);
+      setBreakEndTime(endTime);
+      setIsBreakActive(true);
+
+      // Auto-dismiss modal
+      dismissPopup();
+    } catch (err) { }
+  };
+
+  const stopBreak = async () => {
+    try {
+      await fetch(`${API_BASE_URL}/stop_break`, { method: 'POST' });
+      setIsBreakActive(false);
+      setBreakEndTime(null);
+      setBreakTimeRemaining(0);
     } catch (err) { }
   };
 
@@ -95,6 +230,15 @@ function App() {
     try {
       await fetch(`${API_BASE_URL}/dismiss`, { method: 'POST' });
     } catch (e) {}
+  };
+
+  // Format break time remaining
+  const formatBreakTime = (ms) => {
+    if (ms <= 0) return "0:00";
+    const totalSeconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
   };
 
   return (
@@ -109,21 +253,40 @@ function App() {
         {/* Video Column */}
         <section className="video-section glass-panel">
           <div className="video-wrapper">
-             <img src="http://localhost:5000/video_feed" alt="Video Feed Off: Start Backend!" />
+             <canvas ref={canvasRef} width={640} height={480} style={{ width: '100%', height: 'auto', borderRadius: '12px', backgroundColor: '#000' }} />
           </div>
           <div className="status-badges">
-            <div className={`badge ${stateData.current_state_str === "Normal" ? 'badge-ok' : 'badge-warn'}`}>
-               State: {stateData.current_state_str}
-            </div>
-            <div className="badge badge-neutral">
-               Face Scan: {stateData.emotion_str}
-            </div>
-            <button 
-              className={`badge badge-pointer ${activePomodoro ? 'badge-danger' : 'badge-success'}`}
-              onClick={togglePomodoro}
-            >
-              {activePomodoro ? "⏹ End Pomodoro" : "▶ Start Pomodoro"}
-            </button>
+            {isBreakActive ? (
+              <>
+                <div className="badge badge-break">
+                  ☕ ON BREAK
+                </div>
+                <div className="badge badge-break-timer">
+                  ⏱ {formatBreakTime(breakTimeRemaining)}
+                </div>
+                <button
+                  className="badge badge-danger"
+                  onClick={stopBreak}
+                >
+                  ⏹ Stop Break
+                </button>
+              </>
+            ) : (
+              <>
+                <div className={`badge ${stateData.current_state_str === "Normal" ? 'badge-ok' : 'badge-warn'}`}>
+                   State: {stateData.current_state_str}
+                </div>
+                <div className="badge badge-neutral">
+                   Face Scan: {stateData.emotion_str}
+                </div>
+                <button
+                  className={`badge badge-pointer ${activePomodoro ? 'badge-danger' : 'badge-success'}`}
+                  onClick={togglePomodoro}
+                >
+                  {activePomodoro ? "⏹ End Pomodoro" : "▶ Start Pomodoro"}
+                </button>
+              </>
+            )}
           </div>
         </section>
 
@@ -183,10 +346,10 @@ function App() {
             </div>
 
             <div className="feedback-container">
-               <p>Was this suggestion helpful?</p>
+               <p>Do you accept this suggestion?</p>
                <div className="fb-buttons">
-                 <button className="btn-success" onClick={() => handleFeedback(1.0)}>Yes (+1)</button>
-                 <button className="btn-danger" onClick={() => handleFeedback(-1.0)}>No (-1)</button>
+                 <button className="btn-success" onClick={() => { handleFeedback(1.0); }}>✓ Accept</button>
+                 <button className="btn-danger" onClick={() => { handleFeedback(-1.0); }}>✕ Decline</button>
                </div>
             </div>
 
